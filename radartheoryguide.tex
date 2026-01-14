@@ -1,0 +1,1220 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{geometry}
+\usepackage{hyperref}
+\geometry{margin=1in}
+
+\title{Theory and Architecture of a Modular Radar Simulation Framework}
+\author{bboyg}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\tableofcontents
+\newpage
+
+\section{Introduction}
+
+This document describes the physical models, coordinate systems, signal processing, and software architecture used in a modular monostatic radar simulation.  
+The simulation models:
+\begin{itemize}
+\item Radar geometry and antenna beam patterns,
+\item Target kinematics and attitude,
+\item Radar cross section (RCS) variation with aspect,
+\item Detection via the radar equation,
+\item Tracking via a Kalman filter.
+\end{itemize}
+
+Each theoretical concept is mapped directly to its implementation in the code.
+
+\section{Coordinate Systems}
+
+Three coordinate frames are used:
+
+\subsection{Earth-Centered Earth-Fixed (ECEF)}
+A Cartesian frame fixed to the Earth, used for absolute positions:
+\[
+\mathbf{r}_{\text{ECEF}} = (x, y, z).
+\]
+Conversion from latitude $\phi$, longitude $\lambda$, altitude $h$ uses the WGS-84 ellipsoid.
+
+\subsection{Local East-North-Up (ENU)}
+A tangent plane at the radar location:
+\[
+\mathbf{v}_{\text{ENU}} = [e, n, u]^T.
+\]
+This is the radar’s working frame.
+
+\subsection{Body Frame}
+Attached to the target, rotating with it. Orientation is represented by a rotation matrix:
+\[
+\mathbf{R}_{\text{body}\rightarrow\text{ENU}}.
+\]
+
+% ============================================================
+\section{Trajectory and Attitude Propagation}
+\label{sec:trajectory}
+
+This chapter describes how target motion and orientation are modeled in the simulation.  
+The trajectory model separates \emph{translational motion} (position vs time) from \emph{rotational motion} (attitude vs time).  
+Translational motion is prescribed directly by the scenario, while rotational motion is propagated by integrating angular rates.
+
+\subsection{Trajectory Representation}
+
+A trajectory is defined as discrete time samples:
+\[
+\{t_k,\ \mathbf{p}_k,\ \boldsymbol{\omega}_k\}_{k=0}^{N-1},
+\]
+where:
+\begin{itemize}
+\item $t_k$ is time in seconds,
+\item $\mathbf{p}_k = (\text{lat}_k,\ \text{lon}_k,\ h_k)$ is position in latitude, longitude, altitude (km),
+\item $\boldsymbol{\omega}_k = (p_k,q_k,r_k)$ are body-frame angular rates in rad/s.
+\end{itemize}
+
+The code stores:
+\begin{itemize}
+\item \texttt{self.t} as a 1D array of times,
+\item \texttt{self.pos} as an $N \times 3$ array of LLA samples,
+\item \texttt{self.roll} as an $N \times 3$ array of angular rates.
+\end{itemize}
+
+\subsection{Translational Motion}
+
+The simulation does not integrate translational dynamics (no forces or accelerations).  
+Instead, $\mathbf{p}_k$ is defined explicitly by the scenario generator (e.g. ballistic arc, linear motion, circular arc).
+
+Thus:
+\[
+\mathbf{p}(t) = \text{user-defined}.
+\]
+
+This allows complete freedom in specifying motion (ballistic, orbital, straight-line, etc.) without coupling to the attitude model.
+
+\subsection{Attitude Representation}
+
+Orientation is represented by a rotation matrix:
+\[
+\mathbf{R}_{b\rightarrow e} \in SO(3),
+\]
+mapping vectors from the body frame to the ENU frame.
+
+The matrix satisfies:
+\[
+\mathbf{R}^T\mathbf{R}=\mathbf{I}, \quad \det(\mathbf{R})=+1.
+\]
+
+\subsection{Angular Rate Kinematics}
+
+The body-frame angular rate vector is:
+\[
+\boldsymbol{\omega} =
+\begin{bmatrix} p \\ q \\ r \end{bmatrix}.
+\]
+
+The continuous-time kinematic equation for rotation is:
+\[
+\dot{\mathbf{R}} = \mathbf{R}[\boldsymbol{\omega}]_\times,
+\]
+where $[\boldsymbol{\omega}]_\times$ is the skew-symmetric cross-product matrix:
+\[
+[\boldsymbol{\omega}]_\times =
+\begin{bmatrix}
+0 & -r & q\\
+r & 0 & -p\\
+-q & p & 0
+\end{bmatrix}.
+\]
+
+\subsection{Discrete-Time Integration}
+
+Over a timestep $\Delta t = t_{k+1}-t_k$, assuming $\boldsymbol{\omega}$ is constant over the interval, the exact solution is:
+\[
+\mathbf{R}_{k+1} = \mathbf{R}_k \exp\left([\boldsymbol{\omega}_k]_\times \Delta t\right).
+\]
+
+This is implemented using Rodrigues’ formula.
+
+\subsection{Rodrigues’ Rotation Formula}
+
+Let $\theta = \|\boldsymbol{\omega}\|\Delta t$ and $\hat{\mathbf{u}}=\boldsymbol{\omega}/\|\boldsymbol{\omega}\|$.  
+Then:
+\[
+\exp([\boldsymbol{\omega}]_\times \Delta t)
+= \mathbf{I}
++ \sin\theta [\hat{\mathbf{u}}]_\times
++ (1-\cos\theta)[\hat{\mathbf{u}}]_\times^2.
+\]
+
+This yields a proper rotation matrix for any rotation axis and angle.
+
+In code:
+\begin{itemize}
+\item $\theta$ is computed from $\boldsymbol{\omega}$ and $\Delta t$,
+\item the skew matrix is formed,
+\item Rodrigues’ formula produces the incremental rotation,
+\item it is post-multiplied with the current orientation.
+\end{itemize}
+
+\subsection{Initial Orientation}
+
+The user supplies an initial orientation:
+\[
+\mathbf{R}_0 = \mathbf{R}_{b\rightarrow e}(t_0).
+\]
+
+Often this is chosen as identity:
+\[
+\mathbf{R}_0 = \mathbf{I},
+\]
+meaning body axes are initially aligned with ENU.
+
+\subsection{Numerical Properties}
+
+\subsubsection{Orthogonality Preservation}
+
+Rodrigues’ formula preserves orthogonality analytically.  
+However, floating-point error can accumulate.
+
+The code optionally normalizes or re-orthogonalizes matrices if needed (or this can be added as a post-step).
+
+\subsubsection{Small-Angle Behavior}
+
+When $\|\boldsymbol{\omega}\|\Delta t$ is very small, the formula reduces smoothly to:
+\[
+\exp([\boldsymbol{\omega}]_\times \Delta t) \approx \mathbf{I} + [\boldsymbol{\omega}]_\times \Delta t.
+\]
+
+This avoids numerical instability.
+
+\subsection{Relationship to RCS Modeling}
+
+The body-to-ENU rotation $\mathbf{R}_{b\rightarrow e}$ is used to express the radar line-of-sight in the body frame:
+\[
+\hat{\mathbf{u}}_{b} = \mathbf{R}_{b\rightarrow e}^T \hat{\mathbf{u}}_{e}.
+\]
+
+From $\hat{\mathbf{u}}_b$, the aspect angles $(\phi,\theta)$ are computed and passed into the RCS model:
+\[
+\sigma = \sigma(\phi,\theta,t).
+\]
+
+Thus:
+\[
+\text{trajectory} \rightarrow \text{attitude} \rightarrow \text{aspect} \rightarrow \text{RCS}.
+\]
+
+\subsection{Special Case: Planar ``Flipping'' Target}
+
+For the flipping-disc test:
+\[
+\boldsymbol{\omega} = (\omega,0,0), \quad \omega=\frac{\pi}{2}\ \mathrm{rad/s}.
+\]
+
+This yields a 90° rotation per second about the body $x$-axis, cycling the target through:
+\[
+\text{front} \rightarrow \text{edge} \rightarrow \text{back} \rightarrow \text{edge} \rightarrow \text{front}.
+\]
+
+This directly drives the observed RCS modulation.
+
+\subsection{Assumptions and Limitations}
+
+\begin{itemize}
+\item No translational dynamics (no gravity, drag, thrust).
+\item Angular rates are prescribed, not dynamically computed.
+\item No coupling between translation and rotation.
+\item No modeling of nutation, precession, or torque dynamics.
+\end{itemize}
+
+\subsection{Possible Extensions}
+
+\begin{itemize}
+\item Add rigid-body dynamics with inertia and applied torques.
+\item Integrate attitude using quaternions for improved numerical robustness.
+\item Include aerodynamic or gravitational torques.
+\item Couple translation and rotation (e.g., lift-induced rotation).
+\end{itemize}
+
+\subsection{Summary}
+
+The trajectory module provides:
+\begin{itemize}
+\item Arbitrary translational motion,
+\item Physically correct rotational kinematics,
+\item Clean separation between motion and sensing,
+\item A direct pipeline into RCS and detection physics.
+\end{itemize}
+
+It is the foundation on which the entire radar observability chain is built.
+
+% ============================================================
+\section{Scan Patterns and Beam Pointing Control}
+\label{sec:scan}
+
+This chapter describes how the radar beam is steered in azimuth and elevation as a function of time.
+Scan patterns determine where the radar looks, how long it dwells, and how often a given direction is revisited.
+They are a critical link between sensing physics and track quality.
+
+\subsection{Conceptual Role of a Scan Pattern}
+
+A scan pattern defines a time-parametrized sequence:
+\[
+(\alpha_c(t),\ \epsilon_c(t),\ \Delta t(t)),
+\]
+where:
+\begin{itemize}
+\item $\alpha_c$ is the commanded azimuth,
+\item $\epsilon_c$ is the commanded elevation,
+\item $\Delta t$ is the dwell time at that pointing.
+\end{itemize}
+
+The radar processes one dwell per scan step, after which the scan advances to the next pointing.
+
+\subsection{Software Interface}
+
+All scan patterns implement a common interface:
+\[
+\texttt{next\_pointing}(t) \rightarrow (\alpha,\epsilon,\text{dwell}).
+\]
+
+This makes scan patterns interchangeable and decouples radar physics from scheduling logic.
+
+\subsection{Fixed Pointing (Stare)}
+
+\subsubsection{Definition}
+
+A fixed pointing scan maintains a constant beam direction:
+\[
+\alpha_c(t)=\alpha_0,\quad \epsilon_c(t)=\epsilon_0.
+\]
+
+\subsubsection{Purpose}
+
+Used for:
+\begin{itemize}
+\item track refinement,
+\item stationary experiments,
+\item controlled tests (e.g., flipping target).
+\end{itemize}
+
+\subsubsection{Implementation}
+
+The code simply returns the same angles each call.
+
+\subsection{Circular Scan}
+
+\subsubsection{Definition}
+
+The beam rotates continuously in azimuth at a fixed elevation:
+\[
+\alpha_c(t) = \alpha_0 + \omega t,\quad \epsilon_c(t)=\epsilon_0.
+\]
+
+\subsubsection{Purpose}
+
+Used for:
+\begin{itemize}
+\item horizon surveillance,
+\item detecting targets uniformly around the radar.
+\end{itemize}
+
+\subsection{Sector Scan}
+
+\subsubsection{Definition}
+
+The beam sweeps back and forth between limits:
+\[
+\alpha_{\min} \le \alpha_c(t) \le \alpha_{\max},
+\]
+with a triangular-wave temporal profile.
+
+\subsubsection{Purpose}
+
+Used when interest is confined to a particular angular region.
+
+\subsection{Raster Scan}
+
+\subsubsection{Definition}
+
+Raster scanning covers a 2D region by sweeping azimuth lines at successive elevations:
+\[
+\alpha \in [\alpha_{\min},\alpha_{\max}],\quad
+\epsilon \in [\epsilon_{\min},\epsilon_{\max}].
+\]
+
+Procedure:
+\begin{enumerate}
+\item Sweep azimuth from $\alpha_{\min}$ to $\alpha_{\max}$,
+\item Step elevation by $\Delta \epsilon$,
+\item Repeat.
+\end{enumerate}
+
+\subsubsection{Mathematical Form}
+
+Let $i$ be the azimuth index and $j$ the elevation index:
+\[
+\alpha_{i} = \alpha_{\min} + i\Delta\alpha,\quad
+\epsilon_{j} = \epsilon_{\min} + j\Delta\epsilon.
+\]
+
+\subsection{Temporal Sampling and Revisit Time}
+
+The revisit time for a given direction is:
+\[
+T_{\text{rev}} = N_{\text{points}} \cdot \Delta t_{\text{dwell}},
+\]
+where $N_{\text{points}}$ is the number of pointings in the scan.
+
+Revisit time directly impacts track quality: long revisit times reduce update rate and increase state uncertainty.
+
+\subsection{Relationship to Tracking}
+
+Track update rate depends on:
+\begin{itemize}
+\item whether the beam intersects the target direction,
+\item how often that intersection occurs.
+\end{itemize}
+
+Thus:
+\[
+\text{scan pattern} \rightarrow \text{measurement times} \rightarrow \text{filter stability}.
+\]
+
+\subsection{Adaptive and Track-Driven Scanning}
+
+The code architecture supports adaptive scanning:
+\begin{itemize}
+\item confirmed tracks can request service,
+\item a round-robin queue can schedule track revisits.
+\end{itemize}
+
+While not fully implemented yet, the scan patterns can be extended to:
+\begin{itemize}
+\item prioritize confirmed tracks,
+\item dynamically modify $\alpha_c(t)$ based on predicted track position,
+\item switch between search and track modes.
+\end{itemize}
+
+\subsection{Assumptions and Limitations}
+
+\begin{itemize}
+\item No beam slewing dynamics (instantaneous pointing change),
+\item No mechanical constraints or acceleration limits,
+\item No scan-to-scan coupling with track quality yet.
+\end{itemize}
+
+\subsection{Possible Extensions}
+
+\begin{itemize}
+\item Add beam slew rate limits,
+\item Implement track-while-scan scheduling,
+\item Optimize scan patterns for detection probability,
+\item Introduce stochastic scan perturbations.
+\end{itemize}
+
+\subsection{Summary}
+
+Scan patterns govern the radar’s attention.
+They define where the radar looks, how often it revisits each direction, and how effectively it supports tracking.
+
+They form the operational layer between sensor physics and estimator logic.
+
+% ============================================================
+\section{Radar Sensor and Detection Physics}
+\label{sec:radar}
+
+This chapter describes the physical radar model, including geometry, antenna behavior, signal-to-noise computation, and detection logic.  
+It explains how raw target geometry and radar parameters are transformed into detections.
+
+\subsection{Radar Conceptual Model}
+
+The simulation models a monostatic pulsed radar with:
+\begin{itemize}
+\item A steerable antenna beam,
+\item A single coherent processing interval per dwell,
+\item Noise-limited detection,
+\item No explicit clutter or interference.
+\end{itemize}
+
+Each dwell produces at most one measurement per target.
+
+\subsection{Radar Parameters}
+
+The radar is parameterized by:
+\begin{itemize}
+\item $P_t$ : transmit power [W],
+\item $f$ : carrier frequency [Hz],
+\item $\lambda = c/f$ : wavelength,
+\item $G$ : peak antenna gain (linear),
+\item $\text{BW}_\alpha, \text{BW}_\epsilon$ : 3 dB beamwidths,
+\item $L$ : system loss,
+\item $N_F$ : noise figure,
+\item $B$ : receiver bandwidth,
+\item $T_0$ : system noise temperature,
+\item $\text{SNR}_{\min}$ : detection threshold.
+\end{itemize}
+
+These parameters define the sensitivity and resolution of the radar.
+
+\subsection{Line-of-Sight Geometry}
+
+The radar computes the line-of-sight vector in ENU:
+\[
+\mathbf{\ell} = \mathbf{r}_{\text{target}} - \mathbf{r}_{\text{radar}}.
+\]
+
+Range:
+\[
+R = \|\mathbf{\ell}\|.
+\]
+
+Azimuth and elevation are:
+\[
+\mathrm{az} = \operatorname{atan2}(\ell_E, \ell_N), \quad
+\mathrm{el} = \operatorname{atan2}(\ell_U, \sqrt{\ell_E^2+\ell_N^2}).
+\]
+
+\subsection{Antenna Gain Model}
+
+The antenna mainlobe is approximated by a separable Gaussian:
+\[
+G(\Delta \alpha, \Delta \epsilon) = G_0
+\exp\left(-4\ln2\left(\frac{\Delta\alpha^2}{\text{BW}_\alpha^2}
++ \frac{\Delta\epsilon^2}{\text{BW}_\epsilon^2}\right)\right).
+\]
+
+This model:
+\begin{itemize}
+\item Has unity at boresight,
+\item Falls to $-3$ dB at $\Delta\alpha=\text{BW}_\alpha/2$.
+\end{itemize}
+
+\subsection{Radar Equation}
+
+The SNR is computed using the monostatic radar equation:
+\[
+\text{SNR} =
+\frac{P_t G^2 \lambda^2 \sigma T_{\text{dwell}}}
+{(4\pi)^3 R^4 k T_0 B L N_F}.
+\]
+
+This expression assumes:
+\begin{itemize}
+\item Free-space propagation,
+\item Isotropic thermal noise,
+\item No multipath or fading.
+\end{itemize}
+
+\subsection{Dwell Time}
+
+Longer dwell increases coherent integration time:
+\[
+\text{SNR} \propto T_{\text{dwell}}.
+\]
+
+Thus scan speed trades coverage for sensitivity.
+
+\subsection{Detection Decision}
+
+Detection is binary:
+\[
+\text{detected} =
+\begin{cases}
+1 & \text{if } 10\log_{10}(\text{SNR}) \ge \text{SNR}_{\min},\\
+0 & \text{otherwise}.
+\end{cases}
+\]
+
+\subsection{Field of View Gating}
+
+A RadarFace constrains detections to:
+\[
+\alpha_{\min} \le \mathrm{az} \le \alpha_{\max},\quad
+\epsilon_{\min} \le \mathrm{el} \le \epsilon_{\max},\quad
+R \le R_{\max}.
+\]
+
+Outside this region, detections are suppressed.
+
+\subsection{Aspect-Dependent RCS Coupling}
+
+The radar uses the body-frame line-of-sight vector to query the RCS model:
+\[
+\sigma = \sigma(\phi,\theta,t),
+\]
+linking orientation and detection probability.
+
+\subsection{Assumptions and Limitations}
+
+\begin{itemize}
+\item No Doppler or range-rate modeling,
+\item No clutter or false alarms,
+\item No sidelobe modeling,
+\item No multipath or terrain effects.
+\end{itemize}
+
+\subsection{Possible Extensions}
+
+\begin{itemize}
+\item Add Doppler processing,
+\item Model sidelobes and grating lobes,
+\item Include clutter and CFAR detection,
+\item Add bistatic or multistatic configurations.
+\end{itemize}
+
+\subsection{Summary}
+
+The radar module maps geometry and orientation into measurable quantities via physically interpretable models.
+It is the sensing front-end of the simulation.
+
+
+% ============================================================
+\section{Radar Cross Section Modeling}
+\label{sec:rcs}
+
+This chapter describes how the target's electromagnetic scattering properties are modeled
+and how they are coupled to target orientation and radar line-of-sight.
+
+\subsection{Physical Meaning of Radar Cross Section}
+
+Radar Cross Section (RCS) is defined as:
+\[
+\sigma = \lim_{R \to \infty} 4\pi R^2 \frac{P_{\text{scattered}}}{P_{\text{incident}}},
+\]
+and represents the effective area of a target as seen by the radar.
+
+RCS depends on:
+\begin{itemize}
+\item Target shape and size,
+\item Material properties,
+\item Radar wavelength,
+\item Aspect angles (viewing direction relative to the body),
+\item Polarization (not modeled here).
+\end{itemize}
+
+\subsection{Aspect-Dependent RCS}
+
+The simulation models RCS as a function of body-frame aspect angles:
+\[
+\sigma = \sigma(\phi, \theta, t),
+\]
+where:
+\begin{itemize}
+\item $\phi$ is the azimuth in the body frame,
+\item $\theta$ is the elevation in the body frame,
+\item $t$ allows for time-varying RCS.
+\end{itemize}
+
+\subsection{Mapping from LOS to Body Aspect}
+
+Given the unit line-of-sight vector in ENU, $\hat{\mathbf{u}}_e$, and body-to-ENU rotation $\mathbf{R}_{b\rightarrow e}$:
+
+\[
+\hat{\mathbf{u}}_b = \mathbf{R}_{b\rightarrow e}^T \hat{\mathbf{u}}_e.
+\]
+
+Aspect angles are computed as:
+\[
+\phi = \operatorname{atan2}(u_{b,x}, u_{b,y}), \quad
+\theta = \operatorname{atan2}\left(u_{b,z}, \sqrt{u_{b,x}^2 + u_{b,y}^2}\right).
+\]
+
+\subsection{General RCS Grid Model}
+
+The general RCS model stores a sampled RCS map:
+\[
+\sigma_{ij} = \sigma(\phi_i,\theta_j),
+\]
+on a regular grid of angles.
+
+Interpolation is performed using bilinear interpolation in $(\phi,\theta)$ space.
+
+\subsection{Simple Parametric Flip Model}
+
+For controlled experiments, a simplified model is used:
+
+\begin{itemize}
+\item $\sigma_{\text{front}}$ when target faces radar,
+\item $\sigma_{\text{back}}$ when target faces away,
+\item $\sigma_{\text{edge}}$ when target is sideways.
+\end{itemize}
+
+The model classifies the aspect angle into one of these regions based on $\theta$ and $\phi$.
+
+\subsection{Apparent RCS}
+
+Apparent RCS includes antenna gain:
+\[
+\sigma_{\text{app}} = \sigma \frac{G(\Delta\alpha,\Delta\epsilon)}{G_0}.
+\]
+
+This accounts for reduced illumination when off-boresight.
+
+\subsection{Temporal Variation}
+
+Time-varying RCS is supported through explicit dependence on $t$ or via time-varying orientation.
+
+\subsection{Assumptions and Limitations}
+
+\begin{itemize}
+\item Monostatic RCS only,
+\item No polarization dependence,
+\item No frequency dependence,
+\item No speckle or scintillation,
+\item No multipath or shadowing.
+\end{itemize}
+
+\subsection{Possible Extensions}
+
+\begin{itemize}
+\item Polarization modeling,
+\item Frequency-dependent RCS,
+\item Stochastic RCS fluctuations (Swerling models),
+\item Bistatic RCS,
+\item High-fidelity EM solvers.
+\end{itemize}
+
+\subsection{Summary}
+
+The RCS model provides the link between target geometry, orientation, and detectability.
+It is the mechanism by which physical shape influences radar observability.
+
+
+% ============================================================
+\section{Radar Face and Field-of-View Gating}
+\label{sec:radarface}
+
+This chapter describes how geometric visibility constraints are applied to radar detections.
+The radar face defines where the radar is physically capable of observing and imposes hard constraints on detections.
+
+\subsection{Motivation for Field-of-View Modeling}
+
+Real radars are mechanically and electronically constrained:
+\begin{itemize}
+\item Antennas can only steer within certain azimuth/elevation limits,
+\item Terrain, mounting, and platform geometry restrict visibility,
+\item Sensors may be sector-limited (e.g., shipboard or vehicle-mounted radars).
+\end{itemize}
+
+The radar face models these constraints explicitly.
+
+\subsection{Definition of the Radar Face}
+
+A radar face is defined by:
+\[
+\alpha_{\min}, \alpha_{\max}, \epsilon_{\min}, \epsilon_{\max}, R_{\max}.
+\]
+
+These define a 3D angular sector:
+\begin{itemize}
+\item Azimuth bounds: $[\alpha_{\min},\alpha_{\max}]$,
+\item Elevation bounds: $[\epsilon_{\min},\epsilon_{\max}]$,
+\item Maximum detection range $R_{\max}$.
+\end{itemize}
+
+Only detections within this volume are considered valid.
+
+\subsection{Wrap-Aware Angular Gating}
+
+Azimuth is circular modulo $2\pi$.  
+The interval $[\alpha_{\min},\alpha_{\max}]$ may wrap around zero (e.g., 300° to 60°).
+
+To handle this robustly:
+\[
+\text{span} = (\alpha_{\max}-\alpha_{\min}) \bmod 2\pi.
+\]
+
+If span $\approx 2\pi$, the face covers all azimuths.
+
+Otherwise:
+\[
+\text{az\_ok} =
+\begin{cases}
+\alpha_{\min} \le \alpha \le \alpha_{\max}, & \alpha_{\min} \le \alpha_{\max},\\
+(\alpha \ge \alpha_{\min}) \lor (\alpha \le \alpha_{\max}), & \alpha_{\min} > \alpha_{\max}.
+\end{cases}
+\]
+
+\subsection{Elevation Gating}
+
+Elevation is linear and bounded:
+\[
+\epsilon_{\min} \le \epsilon \le \epsilon_{\max}.
+\]
+
+\subsection{Range Gating}
+
+Targets beyond $R_{\max}$ are suppressed:
+\[
+R \le R_{\max}.
+\]
+
+\subsection{Combined Visibility Test}
+
+A detection is visible if and only if:
+\[
+\text{visible} = (\text{az\_ok}) \land (\text{el\_ok}) \land (R \le R_{\max}).
+\]
+
+\subsection{Interaction with Detection}
+
+The radar face operates after raw detection:
+
+\begin{enumerate}
+\item Radar computes SNR and provisional detection,
+\item RadarFace checks geometric visibility,
+\item If not visible, detection is forced false.
+\end{enumerate}
+
+This preserves physical realism by preventing detections outside mechanical limits.
+
+\subsection{Implementation Details}
+
+The gating logic is implemented in \texttt{RadarFace.is\_within\_fov()}.
+
+Important considerations:
+\begin{itemize}
+\item Azimuth values are wrapped to $[-\pi,\pi)$ before comparison,
+\item Full-circle faces are detected and treated as always visible,
+\item Small numerical tolerances avoid wrap-edge artifacts.
+\end{itemize}
+
+\subsection{Practical Examples}
+
+\paragraph{Forward-facing radar:}
+\[
+\alpha_{\min}=-90^\circ,\ \alpha_{\max}=90^\circ.
+\]
+
+\paragraph{Shipboard starboard face:}
+\[
+\alpha_{\min}=0^\circ,\ \alpha_{\max}=180^\circ.
+\]
+
+\paragraph{Full surveillance radar:}
+\[
+\alpha_{\min}=0^\circ,\ \alpha_{\max}=360^\circ.
+\]
+
+\subsection{Assumptions and Limitations}
+
+\begin{itemize}
+\item No terrain masking or shadowing,
+\item No occlusion by the host platform,
+\item No diffraction or sidelobe visibility,
+\item No time-varying mechanical limits.
+\end{itemize}
+
+\subsection{Possible Extensions}
+
+\begin{itemize}
+\item Add terrain and horizon masking,
+\item Include platform attitude constraints,
+\item Support dynamic FOV (e.g., gimbal limits),
+\item Add per-face sidelobe detection models.
+\end{itemize}
+
+\subsection{Summary}
+
+The radar face defines what is physically observable.
+It acts as a geometric filter that enforces realism on the detection process and scan logic.
+
+
+% ============================================================
+\section{Tracking: Estimation, Association, and Track Management}
+\label{sec:tracking}
+
+This chapter describes in detail how tracking is implemented in the simulation.
+The code uses a \emph{constant-velocity} (CV) \emph{Extended Kalman Filter} (EKF),
+with measurements in spherical coordinates:
+\[
+\mathbf{z} = [R,\ \mathrm{az},\ \mathrm{el}]^T,
+\]
+where \(R\) is slant range, \(\mathrm{az}\) is azimuth, and \(\mathrm{el}\) is elevation in the radar ENU frame.  
+Track-to-measurement association is performed with nearest-neighbor (NN) gating, and track life-cycle management
+includes hit/miss counting and confirmation logic.
+
+\subsection{State Definition and Kinematic Model}
+
+Each track maintains a 6D Cartesian state in the radar local ENU frame:
+\[
+\mathbf{x} =
+\begin{bmatrix}
+x & y & z & v_x & v_y & v_z
+\end{bmatrix}^T,
+\]
+where \((x,y,z)\) are position components (East, North, Up) in meters,
+and \((v_x,v_y,v_z)\) are velocities in meters per second.
+
+\subsubsection{Constant-Velocity Discrete-Time Dynamics}
+
+The constant-velocity model assumes velocity is approximately constant between updates:
+\[
+\mathbf{x}_{k+1} = \mathbf{F}(\Delta t)\mathbf{x}_k + \mathbf{w}_k,
+\]
+with state transition matrix
+\[
+\mathbf{F}(\Delta t)=
+\begin{bmatrix}
+\mathbf{I}_3 & \Delta t\,\mathbf{I}_3\\
+\mathbf{0}_3 & \mathbf{I}_3
+\end{bmatrix}.
+\]
+This matches the implementation (where \(F_{0,3}=F_{1,4}=F_{2,5}=\Delta t\)). \\
+The process noise \(\mathbf{w}_k\) captures unmodeled accelerations.
+
+\subsection{Process Noise Model: White-Acceleration (Integrated) Noise}
+
+The code uses a white-acceleration process noise model.
+Let the continuous-time acceleration be white noise with spectral density parameter \(q\) (code parameter \texttt{q\_acc}).
+The corresponding discrete-time process noise covariance for one axis is the standard integrated form:
+\[
+\mathbf{Q}_{1D}(\Delta t) = q
+\begin{bmatrix}
+\frac{\Delta t^4}{4} & \frac{\Delta t^3}{2}\\
+\frac{\Delta t^3}{2} & \Delta t^2
+\end{bmatrix}.
+\]
+For 3D with independent axes, \(\mathbf{Q}\) is block-diagonal across axes, yielding:
+\[
+\mathbf{Q}(\Delta t)=
+\begin{bmatrix}
+q\frac{\Delta t^4}{4}\mathbf{I}_3 & q\frac{\Delta t^3}{2}\mathbf{I}_3\\
+q\frac{\Delta t^3}{2}\mathbf{I}_3 & q\Delta t^2 \mathbf{I}_3
+\end{bmatrix}.
+\]
+This is exactly how \texttt{CVKalman.Q(dt)} is filled:
+\[
+Q_{pp}=q\Delta t^4/4,\quad Q_{pv}=q\Delta t^3/2,\quad Q_{vv}=q\Delta t^2.
+\]
+The parameter \(q\) is a tuning knob: higher \(q\) allows the filter to follow more maneuvering targets
+at the cost of noisier estimates.
+
+\subsection{Kalman Prediction Step}
+
+Given the current estimate \((\mathbf{x},\mathbf{P})\), prediction is:
+\[
+\mathbf{x}^{-}_{k+1} = \mathbf{F}(\Delta t)\mathbf{x}_k,\qquad
+\mathbf{P}^{-}_{k+1} = \mathbf{F}(\Delta t)\mathbf{P}_k\mathbf{F}(\Delta t)^T + \mathbf{Q}(\Delta t).
+\]
+In code, this is \texttt{CVKalman.predict(dt)}.
+
+\subsection{Measurement Model in Spherical Coordinates}
+
+Radar detections are treated as measurements of range, azimuth, and elevation:
+\[
+\mathbf{z} =
+\begin{bmatrix}
+R\\ \mathrm{az}\\ \mathrm{el}
+\end{bmatrix}.
+\]
+The EKF needs a nonlinear measurement function \(\mathbf{h}(\mathbf{x})\).
+
+\subsubsection{Line-of-Sight Geometry}
+
+Let \(\mathbf{r}=[x,y,z]^T\) be the target position in ENU and \(\mathbf{r}_r\) the radar position in ENU (often zero in your simulation).
+Define the line-of-sight vector:
+\[
+\mathbf{\ell} = \mathbf{r} - \mathbf{r}_r =
+\begin{bmatrix}
+\ell_E\\ \ell_N\\ \ell_U
+\end{bmatrix}.
+\]
+Then
+\[
+R = \|\mathbf{\ell}\| = \sqrt{\ell_E^2+\ell_N^2+\ell_U^2}.
+\]
+Azimuth is measured from North toward East (consistent with \(\arctan2(E,N)\)):
+\[
+\mathrm{az} = \operatorname{atan2}(\ell_E,\ \ell_N).
+\]
+Elevation is:
+\[
+\mathrm{el} = \operatorname{atan2}\!\left(\ell_U,\ \sqrt{\ell_E^2+\ell_N^2}\right).
+\]
+This is implemented by \texttt{CVKalman.h(x, radar\_pos\_enu)}.
+The code also maps azimuth into \([0,2\pi)\) by adding \(2\pi\) if negative.
+
+\subsection{Extended Kalman Filter Update}
+
+The EKF linearizes \(\mathbf{h}\) around the predicted state \(\mathbf{x}^{-}\):
+\[
+\mathbf{z} \approx \mathbf{h}(\mathbf{x}^{-}) + \mathbf{H}(\mathbf{x}^{-})(\mathbf{x}-\mathbf{x}^{-}) + \mathbf{v},
+\]
+where \(\mathbf{v}\sim \mathcal{N}(0,\mathbf{R})\) and \(\mathbf{H}\) is the Jacobian:
+\[
+\mathbf{H} = \frac{\partial \mathbf{h}}{\partial \mathbf{x}}.
+\]
+
+\subsubsection{Numeric Jacobian Used in Code}
+
+Rather than implementing closed-form derivatives, the code computes \(\mathbf{H}\) numerically:
+\[
+H_{:,i} \approx \frac{\mathbf{h}(\mathbf{x} + \epsilon_i \mathbf{e}_i) - \mathbf{h}(\mathbf{x})}{\epsilon_i},
+\]
+with a scale-aware perturbation vector:
+\[
+\epsilon = [1,1,1,0.1,0.1,0.1],
+\]
+meaning 1 meter perturbations in position and 0.1 m/s in velocity.
+This is implemented in \texttt{CVKalman.H\_numeric}.
+
+\paragraph{Angle wrapping in the Jacobian.}
+Because azimuth is angular and wraps at \(2\pi\), the code wraps the azimuth difference during Jacobian calculation:
+\[
+\Delta \mathrm{az} \leftarrow \mathrm{wrap}(\Delta \mathrm{az}),
+\]
+ensuring that derivatives near \(0/2\pi\) are not corrupted by discontinuities.
+
+\subsubsection{Innovation (Residual) and Wrapping}
+
+Define the predicted measurement:
+\[
+\hat{\mathbf{z}} = \mathbf{h}(\mathbf{x}^{-}).
+\]
+Innovation:
+\[
+\mathbf{y} = \mathbf{z} - \hat{\mathbf{z}}.
+\]
+Azimuth residual must be wrapped:
+\[
+y_{\mathrm{az}} \leftarrow \mathrm{wrap}(y_{\mathrm{az}}),
+\]
+which the code does via \texttt{angle\_wrap}.
+
+\subsubsection{Kalman Gain and Covariance Update}
+
+Innovation covariance:
+\[
+\mathbf{S} = \mathbf{H}\mathbf{P}^{-}\mathbf{H}^T + \mathbf{R}.
+\]
+Kalman gain:
+\[
+\mathbf{K} = \mathbf{P}^{-}\mathbf{H}^T \mathbf{S}^{-1}.
+\]
+State update:
+\[
+\mathbf{x}^{+} = \mathbf{x}^{-} + \mathbf{K}\mathbf{y}.
+\]
+Covariance update (as implemented):
+\[
+\mathbf{P}^{+} = (\mathbf{I} - \mathbf{K}\mathbf{H})\mathbf{P}^{-}.
+\]
+These correspond exactly to \texttt{CVKalman.update}.
+
+\paragraph{Note on Joseph form.}
+A numerically robust alternative is the Joseph stabilized update:
+\[
+\mathbf{P}^{+} = (\mathbf{I}-\mathbf{K}\mathbf{H})\mathbf{P}^{-}(\mathbf{I}-\mathbf{K}\mathbf{H})^T + \mathbf{K}\mathbf{R}\mathbf{K}^T.
+\]
+Your current code uses the simpler form; for most benign scenarios it is adequate,
+but Joseph form can help maintain symmetry/PSD under numerical stress.
+
+\subsection{Measurement Noise Model \(\mathbf{R}\)}
+
+Measurement covariance \(\mathbf{R}\) is a 3x3 matrix for \([R,\mathrm{az},\mathrm{el}]\).  
+If not provided, the code uses defaults:
+\[
+\mathbf{R} = \mathrm{diag}\left(25^2,\ (\mathrm{deg2rad}(0.2))^2,\ (\mathrm{deg2rad}(0.2))^2\right).
+\]
+Interpreting these:
+\begin{itemize}
+\item Range standard deviation: 25 m,
+\item Azimuth standard deviation: 0.2 degrees,
+\item Elevation standard deviation: 0.2 degrees.
+\end{itemize}
+This is a convenient starting point; in higher fidelity modeling these could be functions of SNR, beamwidth, and waveform.
+
+\subsection{Track Initialization from a Single Detection}
+
+When a detection \((R,\mathrm{az},\mathrm{el})\) is not associated to any existing track,
+a new track is spawned.
+
+The code converts the spherical measurement into ENU Cartesian position:
+\[
+\ell_E = R\cos(\mathrm{el})\sin(\mathrm{az}),\quad
+\ell_N = R\cos(\mathrm{el})\cos(\mathrm{az}),\quad
+\ell_U = R\sin(\mathrm{el}).
+\]
+Then:
+\[
+\mathbf{r} = \mathbf{r}_r + [\ell_E,\ell_N,\ell_U]^T.
+\]
+Velocities are initialized to zero:
+\[
+[v_x,v_y,v_z] = [0,0,0].
+\]
+This is implemented in \texttt{TrackManager.\_init\_state\_from\_meas}.
+
+\subsubsection{Initial Covariance}
+
+The code assigns a relatively large initial covariance:
+\[
+\mathbf{P}_0 = \mathrm{diag}(500^2,\ 500^2,\ 200^2,\ 50^2,\ 50^2,\ 20^2).
+\]
+This encodes significant uncertainty in initial position and velocity,
+letting the filter converge as more detections arrive.
+
+\subsubsection{Process Noise Tuning for New Tracks}
+
+New tracks use \texttt{q\_acc=5.0}, which sets the process noise power in \texttt{CVKalman.Q(dt)}.
+This value governs how quickly the track can adapt to changes in motion.
+
+\subsection{Association and Gating (Nearest Neighbor)}
+
+Given a set of detections \(\{\mathbf{z}_i\}\) and existing tracks \(\{T_j\}\),
+the code tries to assign at most one detection to each track.
+
+\subsubsection{Predicting Each Track's Measurement}
+
+For each track, a predicted measurement is computed from the predicted state:
+\[
+\hat{\mathbf{z}}_j = \mathbf{h}(\mathbf{x}_j,\mathbf{r}_r).
+\]
+This is done by \texttt{\_meas\_from\_track} using \texttt{CVKalman.h}.
+
+\subsubsection{Rectangular Gates}
+
+A detection \(\mathbf{z}\) is eligible for a track if:
+\[
+|R-\hat{R}| \le g_R,\quad
+|\mathrm{wrap}(\mathrm{az}-\widehat{\mathrm{az}})| \le g_{\mathrm{az}},\quad
+|\mathrm{el}-\widehat{\mathrm{el}}| \le g_{\mathrm{el}},
+\]
+where \(g_R\), \(g_{\mathrm{az}}\), \(g_{\mathrm{el}}\) are gate thresholds
+(set from \texttt{gate\_range\_m}, \texttt{gate\_az\_deg}, \texttt{gate\_el\_deg}).
+This is a simple and fast gating strategy.
+
+\subsubsection{Nearest-Neighbor Scoring}
+
+Among detections that pass the gate, the code selects the one with smallest score:
+\[
+\text{score}(\mathbf{z},\hat{\mathbf{z}})
+=
+\frac{|R-\hat{R}|}{g_R}
++
+\frac{|\mathrm{wrap}(\mathrm{az}-\widehat{\mathrm{az}})|}{g_{\mathrm{az}}}
++
+\frac{|\mathrm{el}-\widehat{\mathrm{el}}|}{g_{\mathrm{el}}}.
+\]
+This is a normalized Manhattan-like residual metric.
+
+\paragraph{Why normalize by gate sizes?}
+It makes the score dimensionless and ensures that range and angles contribute comparably
+relative to their acceptance thresholds.
+
+\subsubsection{Update and Bookkeeping}
+
+If a track is assigned a detection:
+\begin{itemize}
+\item EKF update is applied,
+\item \texttt{hits} increments,
+\item \texttt{misses} resets to 0,
+\item \texttt{last\_update\_t} updated.
+\end{itemize}
+
+If no detection is assigned:
+\begin{itemize}
+\item \texttt{misses} increments,
+\item if misses exceed \texttt{drop\_misses}, the track is deleted.
+\end{itemize}
+
+\subsection{Track Confirmation Logic}
+
+Tracks begin unconfirmed. A track becomes confirmed when:
+\[
+\texttt{hits} \ge \texttt{promote\_hits}.
+\]
+Once confirmed, the track is eligible for scheduling service in the round-robin queue.
+
+\paragraph{Interpretation.}
+This implements a basic \(M/N\)-like confirmation rule (though here it is simply \(M\) hits total, not necessarily consecutive).
+The intention is to prevent single spurious detections from creating persistent tracks.
+
+\subsection{Track Deletion Logic}
+
+Tracks are removed when:
+\[
+\texttt{misses} \ge \texttt{drop\_misses}.
+\]
+Deletion removes them from both the active track map and the round-robin service queue.
+
+\subsection{Round-Robin Track Service Scheduling}
+
+The code maintains a deque of confirmed track IDs.
+When the radar needs to decide which confirmed track to service next, it uses:
+\[
+\texttt{tid} \leftarrow \texttt{popleft()},\quad \texttt{append}(tid).
+\]
+This produces a simple round-robin schedule, implemented in \texttt{next\_track\_for\_service()}.
+
+\paragraph{Connection to radar control.}
+In a full Track-While-Scan system, this method supports allocating additional dwell time
+to confirmed tracks (track updates) while still scanning the broader volume.
+Your current simulation includes the mechanism but may not yet drive scan-pointing
+based on this queue (depending on how \texttt{main.py} uses it).
+
+\subsection{Assumptions, Limitations, and Extensions}
+
+\subsubsection{Assumptions}
+\begin{itemize}
+\item Single-radar monostatic geometry, ENU local frame.
+\item Measurement vector is \((R,\mathrm{az},\mathrm{el})\) with fixed covariance \(\mathbf{R}\).
+\item Targets follow nearly constant velocity with random accelerations.
+\item Association uses nearest neighbor with rectangular gates.
+\end{itemize}
+
+\subsubsection{Limitations}
+\begin{itemize}
+\item No explicit false-alarm model or clutter; detections are assumed target-originated.
+\item No track splitting/merging logic; multi-target scenarios can cause association errors.
+\item Jacobian computed numerically (robust, but slower than analytic form).
+\item Covariance update uses simple form rather than Joseph stabilized form.
+\end{itemize}
+
+\subsubsection{Suggested Extensions}
+\begin{itemize}
+\item \textbf{Statistical gating:} Replace rectangular gates with Mahalanobis gating
+\(\mathbf{y}^T\mathbf{S}^{-1}\mathbf{y} \le \gamma\).
+\item \textbf{Probabilistic association:} Implement PDAF or JPDA for dense target environments.
+\item \textbf{SNR-dependent measurement noise:} Make \(\mathbf{R}\) depend on SNR and beamwidth
+(e.g., angle variance proportional to \(\text{BW}^2/\text{SNR}\)).
+\item \textbf{Track management:} Use an \(M\)-of-\(N\) consecutive hits rule and separate tentative/confirmed states.
+\item \textbf{Joseph form covariance:} Improve numerical stability, especially with long runs.
+\end{itemize}
+
+
+\section{Simulation Flow}
+
+At each timestep:
+\begin{enumerate}
+\item Update scan pointing,
+\item Compute LOS and angles,
+\item Compute antenna gain,
+\item Compute RCS from orientation,
+\item Compute SNR and detection,
+\item Apply FOV gating,
+\item Feed detections into tracker,
+\item Save output.
+\end{enumerate}
+
+\section{Visualization}
+
+The output is post-processed to show:
+\begin{itemize}
+\item Azimuth/elevation tracks,
+\item RCS vs time,
+\item Beam footprint and target position,
+\item Target orientation animation.
+\end{itemize}
+
+\section{Conclusion}
+
+This framework cleanly separates physics, geometry, signal processing, and tracking into modular components.  
+It allows experimentation with scan strategies, RCS models, and tracker parameters while remaining physically interpretable.
+
+\end{document}
