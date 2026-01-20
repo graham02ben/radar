@@ -1,0 +1,5 @@
+# LaTeX auxiliary and source files
+*.aux
+*.out
+*.tex
+*.toc
